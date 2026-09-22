@@ -1,0 +1,20 @@
+stages:
+  - deploy
+
+deploy_backend:
+  stage: deploy
+  image: alpine:latest
+
+  before_script:
+    - apk add --no-cache openssh-client
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/id_ed25519
+    - chmod 600 ~/.ssh/id_ed25519
+    - ssh-keyscan -H "$AWS_HOST" >> ~/.ssh/known_hosts
+
+  script:
+    - ssh -i ~/.ssh/id_ed25519 "$AWS_USER@$AWS_HOST" "cd ~/shopkart/shopkart-backend && git fetch origin && git reset --hard origin/main && cd ~/shopkart && docker compose up -d --build backend && docker compose exec -T backend php artisan optimize:clear && docker compose ps backend"
+
+  only:
+    - main
