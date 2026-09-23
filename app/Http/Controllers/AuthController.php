@@ -24,6 +24,8 @@ class AuthController extends Controller
             'name' => $validated['name'],
             'email' => $validated['email'],
             'password' => Hash::make($validated['password']),
+            'role' => 'customer',
+            'status' => 'active',
         ]);
 
         $token = $user->createToken('auth-token')->plainTextToken;
@@ -49,10 +51,25 @@ class AuthController extends Controller
 
         $user = User::where('email', $validated['email'])->first();
 
-        if (!$user || !Hash::check($validated['password'], $user->password)) {
+        if (!$user) {
             return response()->json([
-                'message' => 'Invalid email or password',
+                'message' => 'Account does not exist. You do not have an account yet, please register or sign up first before logging in.',
+                'code' => 'ACCOUNT_NOT_FOUND',
+            ], 404);
+        }
+
+        if (!Hash::check($validated['password'], $user->password)) {
+            return response()->json([
+                'message' => 'Incorrect password. Please check your credentials.',
+                'code' => 'INVALID_PASSWORD',
             ], 401);
+        }
+
+        if ($user->status === 'blocked') {
+            return response()->json([
+                'message' => 'Your account has been suspended. Please contact support.',
+                'code' => 'ACCOUNT_BLOCKED',
+            ], 403);
         }
 
         $token = $user->createToken('auth-token')->plainTextToken;

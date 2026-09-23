@@ -17,8 +17,10 @@ class User extends Authenticatable
     protected $fillable = [
         'name',
         'email',
+        'phone',
         'password',
         'role',
+        'status',
     ];
 
     protected $hidden = [
@@ -52,5 +54,20 @@ class User extends Authenticatable
     public function reviews(): HasMany
     {
         return $this->hasMany(Review::class);
+    }
+
+    public function wishlists(): HasMany
+    {
+        return $this->hasMany(Wishlist::class);
+    }
+
+    public function isAdmin(): bool
+    {
+        return in_array($this->role, ['admin', 'super_admin']) || $this->email === 'karthikm45@gmail.com' || $this->email === 'admin@shopkart.com';
+    }
+
+    public function isSuperAdmin(): bool
+    {
+        return $this->role === 'super_admin' || $this->email === 'karthikm45@gmail.com';
     }
 }

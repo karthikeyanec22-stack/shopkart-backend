@@ -6,6 +6,10 @@ use App\Models\Address;
 use App\Models\Cart;
 use App\Models\Order;
 use App\Models\OrderItem;
+use App\Models\OrderStatusHistory;
+use App\Models\InventoryTransaction;
+use App\Models\Coupon;
+use App\Models\CouponUsage;
 use App\Models\Payment;
 use App\Models\Product;
 use Illuminate\Http\Request;
@@ -18,7 +22,7 @@ class OrderController extends Controller
     public function index(Request $request)
     {
         $orders = Order::where('user_id', $request->user()->id)
-            ->with(['items.product.images', 'address', 'payment'])
+            ->with(['items.product.images', 'address', 'payment', 'statusHistories', 'delivery.deliveryPartner'])
             ->latest()
             ->get();
 
@@ -30,10 +34,19 @@ class OrderController extends Controller
     // GET /api/orders/{id}
     public function show(Request $request, $id)
     {
-        $order = Order::where('user_id', $request->user()->id)
-            ->where('id', $id)
-            ->with(['items.product.images', 'address', 'payment'])
-            ->firstOrFail();
+        $order = Order::with(['items.product.images', 'address', 'payment', 'statusHistories', 'delivery.deliveryPartner'])
+            ->find($id);
+
+        if (!$order) {
+            return response()->json(['message' => 'Order not found.'], 404);
+        }
+
+        // Verify order ownership
+        if ($order->user_id !== $request->user()->id && !$request->user()->isAdmin()) {
+            return response()->json([
+                'message' => 'Forbidden. You do not have permission to view this order.',
+            ], 403);
+        }
 
         return response()->json([
             'order' => $order,
@@ -53,7 +66,8 @@ class OrderController extends Controller
             'postal_code' => ['required', 'string', 'max:20'],
             'country' => ['sometimes', 'string', 'max:255'],
             'payment_method' => ['required', 'string'],
-            'items' => ['sometimes', 'array'], // optional override if cart is empty or frontend passes direct items
+            'coupon_code' => ['nullable', 'string'],
+            'items' => ['sometimes', 'array'],
         ]);
 
         $user = $request->user();
@@ -73,43 +87,89 @@ class OrderController extends Controller
                 'is_default' => true,
             ]);
 
-            // 2. Fetch cart or items
+            // 2. Fetch cart or direct items
             $cart = Cart::where('user_id', $user->id)->with('items.product')->first();
-            $itemsToProcess = [];
+            $itemsData = [];
 
             if ($cart && $cart->items->count() > 0) {
                 foreach ($cart->items as $cartItem) {
-                    $itemsToProcess[] = [
-                        'product' => $cartItem->product,
+                    $itemsData[] = [
+                        'product_id' => $cartItem->product_id,
                         'quantity' => $cartItem->quantity,
-                        'price' => $cartItem->product->price,
                     ];
                 }
             } elseif (!empty($validated['items'])) {
                 foreach ($validated['items'] as $itemData) {
-                    $product = Product::findOrFail($itemData['product_id']);
-                    $itemsToProcess[] = [
-                        'product' => $product,
+                    $itemsData[] = [
+                        'product_id' => $itemData['product_id'],
                         'quantity' => $itemData['quantity'],
-                        'price' => $product->price,
                     ];
                 }
             } else {
                 return response()->json([
                     'message' => 'Your cart is empty.',
-                ], 400);
+                ], 422);
             }
 
-            // 3. Calculate subtotal & totals
+            // 3. Lock products and check stock availability
             $subtotal = 0;
-            foreach ($itemsToProcess as $item) {
-                $subtotal += $item['price'] * $item['quantity'];
+            $itemsToProcess = [];
+
+            foreach ($itemsData as $item) {
+                $product = Product::where('id', $item['product_id'])->lockForUpdate()->first();
+
+                if (!$product) {
+                    throw new \Exception("Product ID {$item['product_id']} not found.");
+                }
+
+                if ($product->stock < $item['quantity']) {
+                    return response()->json([
+                        'message' => "Insufficient stock for product '{$product->name}'. Available: {$product->stock}.",
+                    ], 422);
+                }
+
+                $effectivePrice = ($product->discount_price && $product->discount_price > 0 && $product->discount_price < $product->price)
+                    ? $product->discount_price
+                    : $product->price;
+
+                $subtotal += $effectivePrice * $item['quantity'];
+
+                $itemsToProcess[] = [
+                    'product' => $product,
+                    'quantity' => $item['quantity'],
+                    'price' => $effectivePrice,
+                ];
             }
 
-            $shipping = $subtotal > 999 ? 0 : 49;
-            $totalAmount = $subtotal + $shipping;
+            // 4. Coupon Calculation
+            $discountAmount = 0;
+            $couponId = null;
 
-            // 4. Create Order
+            if (!empty($validated['coupon_code'])) {
+                $coupon = Coupon::where('code', strtoupper($validated['coupon_code']))
+                    ->where('active', true)
+                    ->first();
+
+                if ($coupon) {
+                    if ($subtotal >= $coupon->minimum_order_amount) {
+                        if ($coupon->discount_type === 'percentage') {
+                            $discountAmount = ($subtotal * $coupon->discount_value) / 100;
+                            if ($coupon->maximum_discount && $discountAmount > $coupon->maximum_discount) {
+                                $discountAmount = $coupon->maximum_discount;
+                            }
+                        } else {
+                            $discountAmount = min($coupon->discount_value, $subtotal);
+                        }
+                        $couponId = $coupon->id;
+                    }
+                }
+            }
+
+            $shipping = ($subtotal - $discountAmount) > 999 ? 0 : 49;
+            $tax = round(($subtotal - $discountAmount) * 0.18, 2); // 18% GST estimate
+            $totalAmount = max(0, $subtotal - $discountAmount + $shipping);
+
+            // 5. Create Order
             $orderNumber = 'SK-' . strtoupper(Str::random(8));
 
             $order = Order::create([
@@ -117,12 +177,24 @@ class OrderController extends Controller
                 'address_id' => $address->id,
                 'order_number' => $orderNumber,
                 'subtotal' => $subtotal,
+                'discount_amount' => $discountAmount,
+                'tax_amount' => $tax,
+                'coupon_id' => $couponId,
                 'shipping_amount' => $shipping,
                 'total_amount' => $totalAmount,
-                'status' => 'processing',
+                'status' => 'pending',
+                'delivery_status' => 'pending',
             ]);
 
-            // 5. Create Order Items & Update Stock
+            // 6. Create Status Timeline Entry
+            OrderStatusHistory::create([
+                'order_id' => $order->id,
+                'status' => 'pending',
+                'note' => 'Order placed successfully by customer.',
+                'changed_by' => $user->name,
+            ]);
+
+            // 7. Process Items, Deduct Stock & Record Inventory Transaction
             foreach ($itemsToProcess as $item) {
                 OrderItem::create([
                     'order_id' => $order->id,
@@ -131,13 +203,19 @@ class OrderController extends Controller
                     'price' => $item['price'],
                 ]);
 
-                // Reduce stock
-                if ($item['product']->stock >= $item['quantity']) {
-                    $item['product']->decrement('stock', $item['quantity']);
-                }
+                // Atomic stock decrement
+                $item['product']->decrement('stock', $item['quantity']);
+
+                InventoryTransaction::create([
+                    'product_id' => $item['product']->id,
+                    'type' => 'order_fulfillment',
+                    'quantity' => -$item['quantity'],
+                    'note' => "Stock deducted for Order #{$orderNumber}",
+                    'user_id' => $user->id,
+                ]);
             }
 
-            // 6. Create Payment Record
+            // 8. Process Payment Record
             Payment::create([
                 'order_id' => $order->id,
                 'payment_method' => $validated['payment_method'],
@@ -147,12 +225,31 @@ class OrderController extends Controller
                 'paid_at' => now(),
             ]);
 
-            // 7. Clear cart
+            // Update status to confirmed
+            $order->update(['status' => 'confirmed']);
+            OrderStatusHistory::create([
+                'order_id' => $order->id,
+                'status' => 'confirmed',
+                'note' => 'Payment received & order confirmed.',
+                'changed_by' => 'System',
+            ]);
+
+            // Record Coupon Usage
+            if ($couponId) {
+                CouponUsage::create([
+                    'coupon_id' => $couponId,
+                    'user_id' => $user->id,
+                    'order_id' => $order->id,
+                    'discount_applied' => $discountAmount,
+                ]);
+            }
+
+            // Clear Cart
             if ($cart) {
                 $cart->items()->delete();
             }
 
-            $order->load(['items.product.images', 'address', 'payment']);
+            $order->load(['items.product.images', 'address', 'payment', 'statusHistories']);
 
             return response()->json([
                 'message' => 'Order placed successfully!',

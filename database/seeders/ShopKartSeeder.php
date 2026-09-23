@@ -15,6 +15,15 @@ class ShopKartSeeder extends Seeder
     {
         // 1. Create Admin & Customer Users
         User::updateOrCreate(
+            ['email' => 'karthikm45@gmail.com'],
+            [
+                'name' => 'Karthikeyan (Admin)',
+                'password' => Hash::make('karthi45'),
+                'role' => 'admin',
+            ]
+        );
+
+        User::updateOrCreate(
             ['email' => 'admin@shopkart.com'],
             [
                 'name' => 'ShopKart Admin',

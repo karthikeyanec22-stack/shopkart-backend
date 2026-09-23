@@ -6,7 +6,7 @@ use Closure;
 use Illuminate\Http\Request;
 use Symfony\Component\HttpFoundation\Response;
 
-class AdminMiddleware
+class SuperAdminMiddleware
 {
     public function handle(Request $request, Closure $next): Response
     {
@@ -18,9 +18,9 @@ class AdminMiddleware
             ], 401);
         }
 
-        if (!$user->isAdmin()) {
+        if (!$user->isSuperAdmin()) {
             return response()->json([
-                'message' => 'Forbidden. Admin authorization required.',
+                'message' => 'Forbidden. Super Admin authorization required.',
             ], 403);
         }
 
